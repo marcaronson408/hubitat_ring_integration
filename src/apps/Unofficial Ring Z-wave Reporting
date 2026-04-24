@@ -53,9 +53,9 @@ def mainPage() {
 
 	section("Z-Wave Diagnostics") {
         paragraph "<b>Generate a report of the Z-Wave mesh routing for your Ring devices.</b>"
-        input "rssiThreshold", "decimal", title: "RSSI Threshold", defaultValue: -80, required: true
-        input name: "historyInterval", type: "number", title: "Poll Interval (minutes)", defaultValue: 15, range: "1..60"
-        input name: "onlyRecordChanges", type: "bool", title: "<b>Optimization:</b> Only record history if RSSI or Path changes?", defaultValue: false
+        input "rssiThreshold", "decimal", title: "RSSI Threshold", defaultValue: -69, required: true
+        input name: "historyInterval", type: "number", title: "Poll Interval (minutes)", defaultValue: 1, range: "1..60"
+        input name: "onlyRecordChanges", type: "bool", title: "<b>Optimization:</b> Only record history if RSSI or Path changes?", defaultValue: true
         
         href(name: "historyReport", page: "viewReportPage", title: "Node History Report", description: "View signal strength history over time", params: [type: "history"]) 
     

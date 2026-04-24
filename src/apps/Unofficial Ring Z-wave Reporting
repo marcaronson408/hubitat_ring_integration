@@ -1,0 +1,1100 @@
+/**
+ * Completely Unofficial Ring Z-wave diagnostics
+ *
+ *  Copyright 2022 Marc Aronson
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ *  in compliance with the License. You may obtain a copy of the License at:
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+ *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+ *  for the specific language governing permissions and limitations under the License.
+ * 
+ * Note that this code was written by Google Gemini.
+ */
+
+
+import com.hubitat.app.ChildDeviceWrapper
+import groovy.json.JsonOutput
+import groovy.transform.Field
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLPeerUnverifiedException
+import groovyx.net.http.ResponseParseException
+import org.apache.http.conn.ConnectTimeoutException
+import org.apache.http.conn.HttpHostConnectException
+import groovy.transform.Field
+
+
+definition(
+  name: "Unofficial Ring Z-wave Reporting",
+  namespace: "ring-hubitat-codahq",
+  author: "Marc Aronson",
+  description: "Z-wave reporting for Ring Alarm systems.",
+  category: "Convenience",
+  singleInstance: true,
+  parent: "ring-hubitat-codahq:Unofficial Ring Connect",
+  // Hubitat documentation says these aren't used and should just be set to an empty string
+  iconUrl: "", iconX2Url: "", iconX3Url: "",
+)
+
+preferences {
+  page(name: "mainPage")
+  page(name: "viewReportPage")
+}
+
+def mainPage() {
+
+  dynamicPage(name: "mainPage", title: "Manage Your Ring Devices", uninstall: true, install: true) {
+		section("App Label") {
+            label title: "Assign a name for this app instance", required: false
+        }
+
+	section("Z-Wave Diagnostics") {
+        paragraph "<b>Generate a report of the Z-Wave mesh routing for your Ring devices.</b>"
+        input "rssiThreshold", "decimal", title: "RSSI Threshold", defaultValue: -80, required: true
+        input name: "historyInterval", type: "number", title: "Poll Interval (minutes)", defaultValue: 15, range: "1..60"
+        input name: "onlyRecordChanges", type: "bool", title: "<b>Optimization:</b> Only record history if RSSI or Path changes?", defaultValue: false
+        
+        href(name: "historyReport", page: "viewReportPage", title: "Node History Report", description: "View signal strength history over time", params: [type: "history"]) 
+    
+    }
+      
+    section("Configure Logging", hidden: true, hideable: true) {
+      input name: "descriptionTextEnable", type: "bool", title: "Enable descriptionText logging", defaultValue: false
+      input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
+      input name: "traceLogEnable", type: "bool", title: "Enable trace logging", defaultValue: false
+      input name: "logTiming", type: "bool", title: "Enable performance timer logging", defaultValue: false
+    }
+
+    section("Advanced options", hidden: true, hideable: true) {
+      href(name: "toInspector", page: "deviceHistoryInspectorPage", title: "<b>History Bitmask Decoder</b>", description: "Unpack and log raw binary history for a specific device")
+      paragraph('<b style="font-size: 22px;">Purse all Z-wave diagnostic history data.</b>')
+      paragraph('<b style="color: red;">Do not push this button without understanding the following.</b> Deleting this means the history report will be empty until new data has been recorded. This cannot be undone.')
+
+	  input "btnPurgeHistory", "button", title: "Purge All Z-wave Diagnostic History Data."
+    }
+  }
+}
+
+// Start new code
+
+def appButtonHandler(btn) {
+    log.info "Ring App Button Pressed: ${btn}"
+    switch (btn) {
+        case "btnPurgeHistory": // <-- ADD THIS CASE
+			log.info "Purging history..."
+        	state.rssiHistory = [:]
+    		state.zidNodeidMap = [:]
+    		state.deviceInfo = [:]
+            break
+        case "btnRunConsistencyCheck":
+        	runConsistencyCheck()
+            break
+        case "btnLogHistory":
+            if (settings.inspectZid) {
+                logManualHistory(settings.inspectZid)
+            }
+            break
+    }
+}
+// End new code
+
+
+void installed() { initialize() }
+
+void updated() { 
+    // state.remove("resetFilterFlag")
+
+    initialize() 
+}
+
+void initialize() {
+  logDebug "initialize()"
+  unschedule("captureSignalHistory")
+  captureSignalHistory()
+}
+
+
+void logInfo(msg) {
+  if (descriptionTextEnable) { log.info msg }
+}
+
+void logDebug(msg) {
+  if (logEnable) { log.debug msg }
+}
+
+void logTrace(msg) {
+  if (traceLogEnable) { log.trace msg }
+}
+
+
+@Field static Long lastLogTime = 0
+
+def logTime(String label) {
+    if ( !logTiming ) return
+    long currentTime = now()
+    
+    String elapsedMsg = ""
+    if (lastLogTime > 0) {
+        long elapsed = currentTime - lastLogTime
+        elapsedMsg = " (+${elapsed}ms)"
+    }
+    
+    lastLogTime = currentTime // Update the memory-resident variable
+    
+    log.info "${label}: ${new Date(currentTime).format("HH:mm:ss.SSS")}${elapsedMsg}"
+}
+
+// New code
+
+def viewReportPage(params) {
+    def type = params?.type ?: "node"
+    def displayOutput = ""
+    
+    if (type == "history") {
+        displayOutput = generateHistoryReport()
+    } 
+    dynamicPage(name: "viewReportPage", title: "${type.capitalize()} Health Report", nextPage: "mainPage") {
+        section() {
+            paragraph "<div style='font-family: monospace; white-space: pre; background: #f5f5f5; padding: 10px; border: 1px solid #ccc;'>${displayOutput}</div>"
+        }
+    }
+}
+
+def captureSignalHistory() {
+    lastLogTime = 0
+    logTime("Starting captureSignalHistory")
+    if (state.rssiHistory == null) state.rssiHistory = [:]
+    if (state.zidNodeidMap == null) state.zidNodeidMap = [:]
+    if (state.deviceInfo == null) state.deviceInfo = [:]
+    logDebug "--- Starting Signal History Capture ---"
+    
+    def interval = (settings.historyInterval ?: 15).toInteger()
+    runIn(interval * 60, "captureSignalHistory")
+    
+    def allDevs = parent.getAllRingDevices()
+
+    allDevs.each { dev ->
+		def allData = parent.getDeviceInfo2(dev)
+        def devInfo = allData?.info
+        def sigData = allData?.signal
+        if (!devInfo) return
+        
+        def zid = devInfo.zidLower
+        if (!zid || zid == "" || !sigData || sigData == "[]" || sigData == "" || sigData == "ALARM_HUB") {
+            logDebug "Skipping device ${devInfo.name ?: 'Unknown' } "
+            return
+        }
+        def type = devInfo.typeName ?: ""
+        def displayName = devInfo.name ?: "Unknown"
+        
+        // Hopefully this never happens and this block can be deleted.
+        if (type.contains("API"))  {
+            log.debug "Mysterious type API ${displayName} ${allData}"
+            return
+        }
+
+        def info = state.deviceInfo[zid]
+        if (info == null) {
+            state.deviceInfo[zid] = [name: displayName, firstRecord: null, lastChange: null]
+        } else if (info.name != displayName) {
+            info.name = displayName
+            state.deviceInfo[zid] = info // (one write)
+        }
+
+        // 2. PROCESS PATHS & HISTORY
+        try {
+            def json = (sigData instanceof String) ? new groovy.json.JsonSlurper().parseText(sigData) : sigData
+
+            def localDeviceInfo = state.deviceInfo ?: [:]
+            def localZidMap = state.zidNodeidMap ?: [:]
+            boolean infoChanged = false
+            boolean zidChanged = false
+
+            // Update ZID/NodeID Mapping for the whole mesh.
+            // Deal with positive RSSI values.
+            // Build the list of valid pathes.
+            def validPaths = []
+            json.each { path ->
+                if (path.rssi != null) {
+                    path.rssi = rssiNormalize(path.rssi)
+                    validPaths << path
+                }
+                if (path.zid && path.nodeId != null) {
+                    def nIdStr = path.nodeId.toString()
+
+                    if (!localZidMap.containsKey(nIdStr)) {
+                        localZidMap[nIdStr] = path.zid
+                        zidChanged = true
+                    }
+
+                    if (path.name) {
+                        def info2 = localDeviceInfo[path.zid]
+                        if (info2 == null) {
+                            localDeviceInfo[path.zid] = [name: path.name, firstRecord: null, lastChange: null]
+                            infoChanged = true
+                        } else if (info2.name != path.name) {
+                            info2.name = path.name
+                            infoChanged = true
+                        }
+                    }
+                }
+            }
+
+            if (infoChanged) state.deviceInfo = localDeviceInfo
+            if (zidChanged) state.zidNodeidMap = localZidMap
+
+            // Proceed with History Recording
+            if (validPaths) {
+                def bestPath = validPaths.max { it.rssi.toInteger() }
+                def rssi = Math.abs(bestPath.rssi.toInteger())
+                def nodeId = bestPath.nodeId ? bestPath.nodeId.toInteger() : 1
+                def rawStatus = bestPath?.status?.toString()?.toLowerCase() ?: "unknown"
+                def rawQuality = bestPath?.quality?.toString()?.toLowerCase() ?: "unknown"
+                def status = bestPath?.status ?: "UNKNOWN"
+
+                def currentQual = (rawQuality == "ok" && rawStatus == "valid") ? 1 : 0
+
+                def historyList = state.rssiHistory[zid] ?: []
+
+                // Anchor the entire device logic to its physical check-in time
+                def nowMs = dev.lastActivity?.getTime() ?: now()
+
+                if (state.deviceInfo[zid].firstRecord == null) {
+                    state.deviceInfo[zid].firstRecord = nowMs
+                }
+
+                def startTs = state.deviceInfo[zid].firstRecord ?: nowMs
+                int elapsedMins = Math.min(9999, ((nowMs - startTs) / 60000).toInteger())
+                def packedValue = encodeRSSIHistory(nodeId, currentQual, rssi, elapsedMins)// 1. Get the most recent stored record for comparison
+                def lastData = historyList ? decodeRSSIHistory(historyList[0] as int) : null
+
+				// 2. Comparison Logic (Using Math.abs to prevent 69 vs -69 mismatch)
+                boolean nodeMatch = lastData ? (nodeId == lastData.nodeId) : false
+                boolean rssiMatch = lastData ? (Math.abs(rssi) == Math.abs(lastData.rssi)) : false
+                boolean qualMatch = lastData ? (currentQual == lastData.quality) : false
+                boolean isDataChanged = !lastData || !nodeMatch || !rssiMatch || !qualMatch
+
+                // 3. Verbose Debugging
+                if (lastData) {
+                    logDebug "${displayName} Comparison -> " +
+                              "NODE: [Live:${nodeId} vs Stored:${lastData.nodeId}] (${nodeMatch}), " +
+                              "RSSI: [Live:${rssi} vs Stored:${lastData.rssi}] (${rssiMatch}), " +
+                              "QUAL: [Live:${currentQual} vs Stored:${lastData.quality}] (${qualMatch})"
+                } else {
+                    logDebug "${displayName} Comparison -> No stored data found (isNew)"
+                }
+
+                // 4. Execution Logic
+
+                if (isDataChanged || !settings.onlyRecordChanges) {
+                    logDebug "RSSI History ACTION: ADD NEW ICON (Change:${isDataChanged}, SettingOnlyRecord:${settings.onlyRecordChanges})"
+
+                    if (state.deviceInfo[zid] == null) {
+                        state.deviceInfo[zid] = [name: (displayName ?: "Unknown"), firstRecord: nowMs, lastChange: nowMs]
+                    } else {
+                        state.deviceInfo[zid].lastChange = nowMs
+                    }
+
+
+                    historyList.add(0, packedValue)
+                    // Overflow Logic
+                    if (historyList.size() > 12) {
+                        historyList = historyList.take(12)
+                        def shiftMins = decodeRSSIHistory(historyList[-1] as int).minutes
+
+                        def newFirstTime = state.deviceInfo[zid].firstRecord + (shiftMins * 60000)
+                        if (state.deviceInfo[zid]) state.deviceInfo[zid].firstRecord = newFirstTime
+                        historyList = historyList.collect { p ->
+                            def d = decodeRSSIHistory(p as int)
+                            return encodeRSSIHistory(d.nodeId, d.quality, d.rssi, Math.max(0, d.minutes - shiftMins))
+                        }
+                    }
+                } else {
+                    // Data hasn't changed, so we do NOT update historyList[0].
+                    // This anchors the icon to the minute it was first recorded.
+                    logDebug "RSSI History: No change for ${displayName}. Keeping original timestamp."
+                    // historyList[0] = packedValue
+                }
+                state.rssiHistory[zid] = historyList
+            }
+        } catch (e) { log.error "Capture Error for ${displayName}: ${e}" }
+    }
+    
+    state.lastHistoryCapture = new Date().format("EEE MMM dd, h:mm:ss a", location.timeZone)
+    logDebug "--- Signal History Capture Complete ---"
+    logTime("Finished captureSignalHistory")
+}
+
+// Helper to calculate relative time
+def getTimeAgo(Long millis) {
+    if (!millis) return "No changes recorded"
+    def diff = (now() - millis) / 1000
+    if (diff < 60) return "Just now"
+    if (diff < 3600) return "${(int)(diff/60)}m ago"
+    if (diff < 86400) return "${(int)(diff.toLong() / 3600)}h ${(int)((diff.toLong() % 3600) / 60)}m ago" 
+    // return "${(int)(diff.toLong() / 86400)}d ${String.format('%.2f', ((diff.toLong() % 86400) / 3600.0))}h ago" // 1d 3.25h ago
+    //return "${(int)(diff.toLong() / 86400)}d ${String.format('%dh:%02dm', (int)((diff.toLong() % 86400) / 3600), (int)((diff.toLong() % 3600) / 60))} ago" // 1d 7h:02m ago
+    return "${(int)(diff.toLong() / 86400)}d ${(int)((diff.toLong() % 86400) / 3600)}h ${(int)((diff.toLong() % 3600) / 60)}m ago" // 1d 7h 2m ago
+    // return "${(int)(diff.toLong() / 86400)}d ${String.format('%d:%02d', (int)((diff.toLong() % 86400) / 3600), (int)((diff.toLong() % 3600) / 60))} ago" // 1d 7:02 ago
+}
+
+
+def getDuration(long millis) {
+    long seconds = millis / 1000
+    long days = seconds / 86400
+    long hours = (seconds % 86400) / 3600
+    long minutes = (seconds % 3600) / 60
+    
+    if (days > 0) return "${days}d ${hours}h"
+    if (hours > 0) return "${hours}h ${minutes}m"
+    return "${minutes}m"
+}
+
+// Centralized Marker Colors
+@Field static final String COLOR_MARKER_RECENT    = "#A0A0A0" 
+@Field static final String COLOR_MARKER_ANCIENT   = "#A0A0A0" 
+@Field static final String COLOR_MARKER_COLLISION = "#A0A0A0"
+
+/* Alternative Grays for reference:
+ * Light Gray:  #D3D3D3
+ * Light-Slate: #A0A0A0
+ * Slate Gray:  #708090
+ * Dark Gray:   #A9A9A9
+*/
+
+def generateHistoryReport() {
+    lastLogTime = 0
+    logTime("Entered GenerateHistoryReport")
+    def threshold = (settings.rssiThreshold ?: -80).toInteger()
+    
+    if (state.rssiHistory == null) state.rssiHistory = [:]
+    if (state.deviceInfo == null) state.deviceInfo = [:]
+    
+    def reportRows = prepareDeviceData(threshold)
+    def timeStr = new Date().format("h:mm:ss a")
+    
+    def html = []
+    html << "<div style='display: flex; flex-direction: column; gap: 0; margin: 0 !important; padding: 0 !important; font-family: sans-serif;'>"
+  
+    // Inject CSS for the JavaScript Markers
+	html << """
+    <style>
+        .marker-recent { border-left-color: ${COLOR_MARKER_RECENT} !important; }
+        .marker-ancient { border-left-color: ${COLOR_MARKER_ANCIENT} !important; }
+        .marker-collision { border-left-color: ${COLOR_MARKER_COLLISION} !important; }
+    </style>
+    """
+
+    html << """
+    <div style='display: flex; flex-direction: column; align-items: flex-start; border-bottom: 2px solid #eee; padding-bottom: 6px; margin-bottom: 8px;'>
+        
+        <div style='display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; width: 100%;'>
+            <div>
+				<span style='font-size: 18px; font-weight: bold;'>Z-Wave Signal History <span style='font-size: 13px; font-weight: normal; color: #666; margin-left: 5px;'>@ ${timeStr}</span></span>
+            </div>
+            <div style='display: flex; align-items: center; gap: 10px;'>
+                <input type='text' id='historySearch' onkeyup='filterHistoryTable()' placeholder='Search devices...' style='padding: 2px 8px; border: 1px solid #ccc; border-radius: 4px; width: 180px; font-size: 13px;'>
+                <div style='font-size: 18px; font-weight: bold; white-space: nowrap;'>
+                    <span style='color:#2e7d32;'>●</span> Excellent
+                    <span style='color:#9CCC65; margin-left:8px;'>●</span> Good
+                    <span style='color:#FFC107; margin-left:8px;'>●</span> Fair 
+                    <span style='color:#c62828; margin-left:8px;'>●</span> Poor
+                </div>
+            </div>
+        </div>
+
+        <div class='marker-box' style='background: #f8f9fa; padding: 2px 12px 2px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; line-height: 1; align-self: flex-start; height: fit-content;'>
+            <div style='font-weight: bold; color: #444; font-size: 16px; margin: 1px 0 1px 0;'>Timeline Markers (Browser Saved)</div>
+            <table style='border-collapse: collapse; border-spacing: 0; margin: 0; padding: 0; line-height: 1;'>
+                <tr style='height: 22px;'>
+                    <td style='padding: 0 4px 0 0; vertical-align: middle;'><input type='checkbox' id='m1_active' onchange='saveAndRender()' style='cursor:pointer; display:block; margin:0; padding:0;'></td>
+                    <td style='padding: 0 8px 0 0; vertical-align: middle; font-weight:600; white-space:nowrap;'><label for='m1_active' style='cursor:pointer; margin:0; line-height:1;'>Marker 1:</label></td>
+                    <td style='padding: 0 4px 0 0; vertical-align: middle;'><input type='date' id='m1_date' onchange='saveAndRender()' style='border: 1px solid #ccc; border-radius: 3px; padding: 1px 4px; height: 20px; box-sizing: border-box; margin:0; font-size:13px;'></td>
+                    <td style='padding: 0 4px 0 0; vertical-align: middle;'><input type='time' id='m1_time' onchange='saveAndRender()' style='border: 1px solid #ccc; border-radius: 3px; padding: 1px 4px; height: 20px; box-sizing: border-box; margin:0; font-size:13px;'></td>
+                    <td style='padding: 0; vertical-align: middle;'><input type='text' id='m1_desc' placeholder='Brief description...' onkeyup='saveAndRender()' onchange='saveAndRender()' style='border: 1px solid #ccc; border-radius: 3px; padding: 1px 6px; height: 20px; width: 450px; box-sizing: border-box; margin:0; font-size:13px;'></td>
+                </tr>
+                <tr style='height: 22px;'>
+                    <td style='padding: 0 4px 0 0; vertical-align: middle;'><input type='checkbox' id='m2_active' onchange='saveAndRender()' style='cursor:pointer; display:block; margin:0; padding:0;'></td>
+                    <td style='padding: 0 8px 0 0; vertical-align: middle; font-weight:600; white-space:nowrap;'><label for='m2_active' style='cursor:pointer; margin:0; line-height:1;'>Marker 2:</label></td>
+                    <td style='padding: 0 4px 0 0; vertical-align: middle;'><input type='date' id='m2_date' onchange='saveAndRender()' style='border: 1px solid #ccc; border-radius: 3px; padding: 1px 4px; height: 20px; box-sizing: border-box; margin:0; font-size:13px;'></td>
+                    <td style='padding: 0 4px 0 0; vertical-align: middle;'><input type='time' id='m2_time' onchange='saveAndRender()' style='border: 1px solid #ccc; border-radius: 3px; padding: 1px 4px; height: 20px; box-sizing: border-box; margin:0; font-size:13px;'></td>
+                    <td style='padding: 0; vertical-align: middle;'><input type='text' id='m2_desc' placeholder='Brief description...' onkeyup='saveAndRender()' onchange='saveAndRender()' style='border: 1px solid #ccc; border-radius: 3px; padding: 1px 6px; height: 20px; width: 450px; box-sizing: border-box; margin:0; font-size:13px;'></td>
+                </tr>
+            </table>
+        </div>
+
+    </div>
+    """
+    logTime("Finished big chunk 1")
+    
+    html << buildDeviceTable(reportRows, threshold)
+    logTime("Finished buildDeviceTable")
+    
+    html << """
+    <script>
+        var sortDirections = [1, 1, 1];
+
+        // --- MARKER LOGIC ---
+        function initMarkers() {
+            ['m1', 'm2'].forEach(function(id) {
+                if(localStorage.getItem(id+'_active') === 'true') document.getElementById(id+'_active').checked = true;
+                if(localStorage.getItem(id+'_date')) document.getElementById(id+'_date').value = localStorage.getItem(id+'_date');
+                if(localStorage.getItem(id+'_time')) document.getElementById(id+'_time').value = localStorage.getItem(id+'_time');
+                if(localStorage.getItem(id+'_desc')) document.getElementById(id+'_desc').value = localStorage.getItem(id+'_desc');
+            });
+            renderMarkers();
+        }
+
+        function saveAndRender() {
+            ['m1', 'm2'].forEach(function(id) {
+                localStorage.setItem(id+'_active', document.getElementById(id+'_active').checked);
+                localStorage.setItem(id+'_date', document.getElementById(id+'_date').value);
+                localStorage.setItem(id+'_time', document.getElementById(id+'_time').value);
+                localStorage.setItem(id+'_desc', document.getElementById(id+'_desc').value);
+            });
+            renderMarkers();
+        }
+
+        function renderMarkers() {
+            var times = [];
+            ['m1', 'm2'].forEach(function(id) {
+                var active = document.getElementById(id+'_active').checked;
+                var date = document.getElementById(id+'_date').value;
+                var time = document.getElementById(id+'_time').value;
+                if (active && date && time) {
+                    times.push(new Date(date + 'T' + time).getTime());
+                }
+            });
+
+            // Sort Descending: [Recent (Larger Timestamp), Ancient (Smaller Timestamp)]
+            times.sort(function(a, b) { return b - a; }); 
+
+            var tRecent = times[0] || 0;
+            var tAncient = times[1] || 0;
+
+            // Clear old markers
+            document.querySelectorAll('.grid-cell').forEach(function(cell) {
+                cell.classList.remove('marker-recent', 'marker-ancient', 'marker-collision');
+            });
+
+            if (times.length === 0) return;
+
+            document.querySelectorAll('tr.history-row').forEach(function(row) {
+                var foundRecent = false;
+                var foundAncient = false;
+                var cells = row.querySelectorAll('.grid-cell');
+                
+                for (var i = 0; i < cells.length; i++) {
+                    var cell = cells[i];
+                    var cellTime = parseFloat(cell.getAttribute('data-time')) || 0;
+
+                    if (!foundRecent && cellTime < tRecent) {
+                        if (tAncient > 0 && cellTime < tAncient) {
+                            // Hit both boundaries on the exact same gap
+                            cell.classList.add('marker-collision');
+                            foundRecent = true;
+                            foundAncient = true;
+                        } else {
+                            cell.classList.add('marker-recent');
+                            foundRecent = true;
+                        }
+                    }
+					if (foundRecent && !foundAncient && tAncient > 0 && cellTime < tAncient) {
+                        cell.classList.add('marker-ancient');
+                        foundAncient = true;
+                    }
+
+                    if (foundRecent && (times.length < 2 || foundAncient)) break;
+                }
+            });
+        }
+
+        // --- ORIGINAL TABLE LOGIC ---
+        function toggleNeighbors(zid) {
+            var row = document.getElementById('neigh-' + zid);
+            var btn = document.getElementById('btn-' + zid);
+            if (row.style.display === 'none') {
+                row.style.display = 'table-row';
+                btn.innerHTML = '&#9660;';
+            } else {
+                row.style.display = 'none';
+                btn.innerHTML = '&#9654;';
+            }
+        }
+        
+        function filterHistoryTable() {
+            var input = document.getElementById('historySearch').value.toLowerCase();
+            var rows = document.querySelectorAll('.history-row');
+            rows.forEach(function(row) {
+                var nameContainer = row.querySelector('.device-name');
+                var name = nameContainer ? nameContainer.innerText.toLowerCase() : "";
+                var zid = row.getAttribute('data-zid');
+                var neighRow = document.getElementById('neigh-' + zid);
+                
+                if (name.includes(input)) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                    if (neighRow) neighRow.style.display = 'none';
+                }
+            });
+        }
+        
+        function sortHistoryTable(colIndex, type) {
+            var table = document.getElementById("historyTable");
+            var tbody = table.tBodies[0];
+            var mainRows = Array.from(tbody.querySelectorAll("tr.history-row"));
+            var dir = sortDirections[colIndex];
+            sortDirections[colIndex] = -dir;
+            
+            mainRows.sort(function(a, b) {
+                var aVal, bVal;
+                if (type === "time") {
+                    aVal = a.cells[colIndex].getAttribute("data-time") || 0;
+                    bVal = b.cells[colIndex].getAttribute("data-time") || 0;
+                    return (parseFloat(aVal) - parseFloat(bVal)) * dir;
+                } else {
+                    aVal = a.cells[colIndex].getAttribute("data-sort");
+                    bVal = b.cells[colIndex].getAttribute("data-sort");
+                    if (type === "number") return (parseFloat(aVal) - parseFloat(bVal)) * dir;
+                    return aVal.localeCompare(bVal) * dir;
+                }
+            });
+            
+            mainRows.forEach(function(row, index) {
+                var zid = row.getAttribute('data-zid');
+                var neighRow = document.getElementById('neigh-' + zid);
+                row.style.backgroundColor = (index % 2 === 0) ? "#ffffff" : "#f9f9f9";
+                tbody.appendChild(row);
+                if (neighRow) tbody.appendChild(neighRow);
+            });
+        }
+
+        // Initialize markers on load
+        setTimeout(initMarkers, 100);
+		setTimeout(function() {
+            var box = document.querySelector('.marker-box');
+            if (box) {
+                var table = box.querySelector('table');
+                var label = box.querySelector('div');
+                var targetHeight = table.getBoundingClientRect().height + label.getBoundingClientRect().height + 60;
+                box.style.height = targetHeight + 'px';
+                box.style.overflow = 'hidden';
+            }
+        }, 200);
+    </script>
+    """
+    logTime("Finished big chunk 2")
+    html << "</div>"
+    logTime("Exit GenerateHistoryReport")
+    return html.join("")
+}
+
+
+def prepareDeviceData(threshold) {
+    logTime("Enter prepareDeviceData")
+    def reportRows = []
+    def nowMs = now().toLong()
+    def zidLookup = [:]
+    def metadataLookup = [:] 
+    def extenderToClients = [:] 
+    def globalLatestNodeId = [:]
+    
+    // 1. Map Devices and capture their Node IDs and LIVE signal snapshot
+    parent.getAllRingDevices().each { dev ->
+        def devLabel = "Unknown Device"
+        try {
+            def allData = parent.getDeviceInfo2(dev)
+            def devInfo = allData?.info
+            def sigData = allData?.signal
+            if (!devInfo) return
+            
+            def cleanZid = devInfo.zidLower
+            devLabel = devInfo.label ?: devInfo.name ?: "Node ${devInfo.nodeId}"
+
+            // Filter out devices with no signal data
+            if (!cleanZid || cleanZid == "" || !sigData || sigData == "[]" || sigData == "" || sigData == "ALARM_HUB") {
+                logDebug "Skipping device ${devLabel}"
+                return
+            }
+
+            def nodeId = devInfo.nodeId?.toString()?.trim()
+            def hubId = devInfo.id
+            
+            // Fallback for nodeId
+            if (!nodeId && state.zidNodeidMap) {
+                nodeId = state.zidNodeidMap.find { it.value == cleanZid }?.key
+            }
+            
+            // PRE-CALCULATE neighbor data before building the Map
+            def bestRssi = -128
+            def bestQual = false
+            def foundAnyNeighbor = false
+            def neighborList = []
+
+            try {
+                def rawNeighbors = (sigData instanceof List) ? sigData : new groovy.json.JsonSlurper().parseText(sigData)
+                rawNeighbors.each { n ->
+                    def currentRssi = rssiNormalize(n.rssi)
+                    
+                    // Keep the strongest signal (closest to 0)
+                    if (!foundAnyNeighbor || currentRssi > bestRssi) {
+                        bestRssi = currentRssi
+                        bestQual = (n.quality == "ok")
+                        foundAnyNeighbor = true
+                    }
+
+                    def cleanNZid = n.zid?.toString()
+                    if (cleanNZid && cleanNZid != "1" && cleanZid) {
+                        if (!extenderToClients[cleanNZid]) extenderToClients[cleanNZid] = []
+                        if (!extenderToClients[cleanNZid].contains(cleanZid)) extenderToClients[cleanNZid] << cleanZid
+                    }
+
+                    def nName = (n.nodeId == 1 || n.nodeId == "1") ? "Hub" : (state.deviceInfo[cleanNZid]?.name ?: "Node ${n.nodeId}")
+                    neighborList << [zid: cleanNZid, name: nName, rssi: currentRssi, quality: n.quality, status: n.status]
+                }
+            } catch (innerE) {
+                log.warn "Could not parse neighbors for ${devLabel}: ${innerE}"
+            }
+            
+            // Create the entry Map ONCE with all data already present
+            // This avoids the NPE "Cannot set property on null object"
+            def entry = [
+                hubId: hubId, 
+                nodeId: nodeId, 
+                neighbors: neighborList, 
+                lastActivity: dev.lastActivity, // Using device object activity
+                snapshotRssi: bestRssi, 
+                snapshotQuality: bestQual
+            ]
+            
+            if (cleanZid && devLabel) {
+                if (state.deviceInfo[cleanZid] == null) {
+                    state.deviceInfo[cleanZid] = [name: devLabel, firstRecord: null, lastChange: null]
+                } else {
+                    state.deviceInfo[cleanZid].name = devLabel
+                }
+            }
+
+            // Save to lookup maps
+            if (cleanZid) zidLookup[cleanZid] = entry
+            if (nodeId) zidLookup[nodeId] = entry
+            
+        } catch (e) { 
+            log.error "CRITICAL ERROR processing ${devLabel}: ${e}. Check device in Ring App."
+        }
+    }
+    
+    logTime("prepareDeviceData start section 2")
+
+    // 2. Process History to find current actual paths
+    state.rssiHistory.each { zid, history ->
+        if (!history) return
+        def lookupId = zid.toString()
+                
+        def info = state.deviceInfo[zid] 
+        def name = info?.name ?: "Unknown (${lookupId})"
+        def devEntry = zidLookup[lookupId]
+        
+        def lastUpdate = info?.lastChange ?: 0
+        def firstMs = info?.firstRecord
+
+        def latestData = decodeRSSIHistory(history[0] as int)
+        def latestNId = latestData.nodeId.toString().trim()
+        globalLatestNodeId[lookupId] = latestNId
+        
+        // Use Live Snapshot if found, otherwise fall back to history data
+        def liveRssi = (devEntry && devEntry.snapshotRssi != -128) ? devEntry.snapshotRssi : latestData.rssi
+        def liveQual = (devEntry && devEntry.snapshotRssi != -128) ? devEntry.snapshotQuality : (latestData.quality == 1)
+
+        def emojiList = []
+        int reds = 0, yellows = 0, greens = 0, limes = 0 
+        def rowLastUpdateStr = ""
+        
+        history.each { packed ->
+            def d = decodeRSSIHistory(packed as int)
+            def nId = d.nodeId
+            def nIdStr = nId.toString()
+            def val = d.rssi
+            def elapsedMins = d.minutes
+
+            if (nId > 1) {
+                def pathZid = state.zidNodeidMap ? state.zidNodeidMap[nIdStr] : null
+                if (pathZid) {
+                    if (!extenderToClients[pathZid]) extenderToClients[pathZid] = []
+                    if (!extenderToClients[pathZid].contains(lookupId)) extenderToClients[pathZid] << lookupId
+                }
+            }
+                
+            def pathName = (nId == 1) ? "Hub" : "Node ${nId}"
+            if (nId > 1 && state.zidNodeidMap) {
+                def pathZid = state.zidNodeidMap[nIdStr] 
+                if (pathZid) pathName = state.deviceInfo[pathZid]?.name ?: pathName
+            }
+            
+            def timeAgoStr = "Unknown"
+            def dateTimeStr = ""
+            def eventTimeMs = 0
+            if (firstMs) {
+                eventTimeMs = firstMs.toLong() + (elapsedMins * 60000)
+                def minsAgo = Math.max(0, ((nowMs - eventTimeMs) / 60000).toInteger())
+                timeAgoStr = minsAgo < 60 ? "${minsAgo}m ago" : "${(minsAgo / 60).toInteger()}h ${minsAgo % 60}m ago"
+                dateTimeStr = new Date(eventTimeMs).format("'on' M/d 'at' h:mm a")
+            }
+            
+            def pathKey = "${lookupId}-${nIdStr}".toString()
+            if (!metadataLookup.containsKey(pathKey)) {
+                metadataLookup[pathKey] = [rssi: val, time: timeAgoStr, dateTime: dateTimeStr, color: getSignalColor(val, threshold, d.quality == 1), timeMs: eventTimeMs]
+            }
+            
+            if (packed == history[0]) {
+                metadataLookup[lookupId] = metadataLookup[pathKey]
+                rowLastUpdateStr = dateTimeStr
+            }
+
+            def icon = getSignalIcon(val, nId > 1, threshold, d.quality == 1)
+            
+            if (val < threshold - 10 && d.quality != 1) reds++ 
+            else if (val < threshold - 10 && d.quality == 1) yellows++ 
+            else if (val < threshold) limes++ 
+            else greens++ 
+
+            def qStatus = (d.quality == 1) ? "OK" : "Bad"
+            def hoverText = "${pathName}: ${val}dBm (${qStatus}) | ${timeAgoStr} ${dateTimeStr}"
+
+            def spanStyle = "display:inline-block; width:32px; text-align:center; box-sizing:border-box; line-height:1; cursor:zoom-in; margin-right:4px; border-left:3px solid transparent; margin-left:-3px; padding-left:3px; transition:border-color 0.2s ease"
+            emojiList << "<span class='grid-cell' data-time='${eventTimeMs}' title='${hoverText}' style='${spanStyle}'>${icon}</span>"
+        }
+        
+        reportRows << [
+            zid: lookupId, lastActivity: devEntry?.lastActivity,
+            name: name, rssi: liveRssi, lastUpdateMs: lastUpdate,
+            lastUpdateAbs: rowLastUpdateStr,
+            historyHtml: emojiList.join(""), 
+            hubId: devEntry?.hubId, nodeId: devEntry?.nodeId,
+            color: getSignalColor(liveRssi, threshold, liveQual),
+            hScore: -(Math.min(9, reds) * 1000 + Math.min(9, yellows) * 10 + Math.min(9,limes)) + Math.min(9, greens),
+            neighbors: devEntry?.neighbors ?: [], inboundClients: []
+        ]
+    }
+    
+    logTime("prepareDeviceData start section 3")
+    
+    // 3. Flag Stale Inbound Clients
+    reportRows.each { row ->
+        def clients = extenderToClients[row.zid]
+        if (clients) {
+            def thisExtenderNodeId = row.nodeId?.toString()?.trim() ?: state.zidNodeidMap?.find { it.value == row.zid }?.key
+            clients.each { cZid ->
+                def meta = metadataLookup["${cZid}-${thisExtenderNodeId}".toString()] ?: metadataLookup[cZid]
+                def currentActualPath = globalLatestNodeId[cZid]?.toString()?.trim()
+                def isStale = (currentActualPath && thisExtenderNodeId && currentActualPath != thisExtenderNodeId)
+
+                row.inboundClients << [
+                    name: state.deviceInfo[cZid]?.name ?: "Unknown",
+                    rssi: meta?.rssi ?: 0,
+                    color: meta?.color ?: "#444",
+                    isStale: isStale,
+                    timeStr: "${meta?.time ?: 'N/A'} ${meta?.dateTime ?: ''}",
+                    timeMs: meta?.timeMs ?: 0
+                ]
+            }
+            row.inboundClients.sort { a, b ->
+                if (a.isStale != b.isStale) return a.isStale <=> b.isStale
+                return b.timeMs <=> a.timeMs
+            }
+        }
+    }
+    logTime("Exit prepareDeviceData")
+    return reportRows.sort { it.hScore }
+}
+
+
+def buildDeviceTable(reportRows, threshold) {
+    def html = []
+    html << """
+    <table id='historyTable' style='width: 100%; border-collapse: collapse; table-layout: fixed;'>
+    <tr style='background: #444; color: white; font-size: 12px;'>
+        <th style='padding: 8px 10px; text-align: left; width: 45%; white-space: nowrap;'>
+            Device ( <span onclick='sortHistoryTable(0, "string")' style='cursor:pointer; text-decoration:underline;'>Name ↕</span> | <span onclick='sortHistoryTable(0, "time")' style='cursor:pointer; text-decoration:underline;'>Time ↕</span> )
+        </th>
+        <th onclick='sortHistoryTable(1, "number")' style='padding: 8px 10px; text-align: right; width: 12%; cursor: pointer;'>dBm ↕</th>
+        <th onclick='sortHistoryTable(2, "number")' style='padding: 8px 10px 8px 20px; text-align: left; cursor: pointer;'>History ↕</th>
+    </tr>
+    """
+    
+    reportRows.eachWithIndex { row, i ->
+        def rowBg = (i % 2 == 0) ? "#ffffff" : "#f9f9f9"
+        def nameLabel = row.hubId ? "<a href='/device/edit/${row.hubId}' target='_blank' style='color: #007bff; text-decoration: none; font-weight: bold;'>${row.name}</a>" : "<b>${row.name}</b>"
+
+        // We initialize sortTime with the old Z-wave time as a fallback
+        def sortTime = row.lastUpdateMs 
+        def activityStr = "(Last changed ${getTimeAgo(row.lastUpdateMs)} ${row.lastUpdateAbs ?: ''})"
+        
+        if (row.lastActivity instanceof Date) {
+            // Update sortTime to the new, more accurate platform time
+            sortTime = row.lastActivity.time 
+            long diffMs = now().toLong() - sortTime
+            if (diffMs >= 0) {
+                long d = diffMs / 86400000
+                long h = (diffMs % 86400000) / 3600000
+                long m = (diffMs % 3600000) / 60000
+                def dur = (d > 0 ? "${d}d " : "") + ((h > 0 || d > 0) ? "${h}h " : "") + "${m}m"
+                def dateStr = row.lastActivity.format("M/d 'at' h:mm a", location.timeZone)
+                activityStr = "(Last changed ${dur} ago on ${dateStr})"
+            }
+        }
+        
+        html << "<tr class='history-row' data-zid='${row.zid}' style='border-bottom: 1px solid #eee; background-color: ${rowBg};'>"
+        html << "<td data-sort='${row.name.replace("'", "&#39;")}' data-time='${sortTime}' class='device-name' style='padding: 6px 10px; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;'>"
+        html << "<span id='btn-${row.zid}' onclick='toggleNeighbors(\"${row.zid}\")' style='cursor:pointer; margin-right:10px; color:#555; font-size:14px;'>&#9654;</span>"
+        //DELME html << "${nameLabel} <span style='font-size: 11px; color: #888; margin-left:5px;'>(Last changed ${getTimeAgo(row.lastUpdateMs)} ${row.lastUpdateAbs ?: ''})</span></td>"
+        html << "${nameLabel} <span style='font-size: 11px; color: #888; margin-left:5px;'>${activityStr}</span></td>"
+        html << "<td data-sort='${row.rssi}' style='padding: 6px 10px; text-align: right; font-weight: bold; color: ${row.color}; font-size: 14px;'>${row.rssi}</td>"
+        
+        // ADDED: white-space: nowrap; overflow-x: auto; to enforce the strict CSS Grid approach
+        html << "<td data-sort='${row.hScore}' style='padding: 6px 10px 6px 20px; font-size: 18px; line-height: 1; white-space: nowrap; overflow-x: auto;'>${row.historyHtml}</td>"
+        html << "</tr>"
+
+        html << "<tr id='neigh-${row.zid}' style='display:none; background-color: #f4f6f8;'><td colspan='3' style='padding: 10px 10px 15px 40px;'>"
+        
+        if (row.neighbors) {
+            html << "<div style='font-weight: bold; font-size: 11px; color: #555; text-transform: uppercase; margin-bottom: 8px;'>Outbound: Neighbors this device can see</div>"
+            html << "<div style='display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px;'>"
+			row.neighbors.each { n ->
+                def qColor = n.quality == 'ok' ? '#2e7d32' : '#c62828'
+                def sColor = n.status == 'valid' ? '#1976d2' : '#757575'
+                html << """
+                <div style='display: flex; flex-direction: column; background: white; border: 1px solid #d1d5db; border-radius: 4px; padding: 4px 8px; min-width: 160px; box-shadow: 0 1px 1px rgba(0,0,0,0.05);'>
+                    <div style='font-weight: bold; font-size: 12px; color: #111; margin-bottom: 2px; border-bottom: 1px solid #f0f0f0; padding-bottom: 2px;'>${n.name}</div>
+                    <div style='display: flex; justify-content: space-between; align-items: center; gap: 10px;'>
+                        <span style='font-size: 12px; color: ${getSignalColor(n.rssi, threshold, n.quality == "ok")}; font-weight: 600;'>${n.rssi} <small style='font-weight: normal; color: #999;'>dBm</small></span>
+                        <div style='display: flex; gap: 3px;'>
+                            <span title='Quality' style='font-size: 9px; padding: 0px 4px; border-radius: 3px; background: ${qColor}; color: white; font-weight: bold;'>${n.quality.toUpperCase()}</span>
+                            <span title='Status' style='font-size: 9px; padding: 0px 4px; border-radius: 3px; background: ${sColor}; color: white; font-weight: bold;'>${n.status.toUpperCase()}</span>
+                        </div>
+                    </div>
+                </div>"""
+            }
+            html << "</div>"
+        }
+
+        if (row.inboundClients) {
+            html << "<div style='font-weight: bold; font-size: 11px; color: #555; text-transform: uppercase; margin-bottom: 8px;'>Inbound: Devices routing through this extender</div>"
+            html << "<div style='display: flex; flex-wrap: wrap; gap: 8px;'>"
+            row.inboundClients.each { c ->
+                def labelStyle = c.isStale ? "color: #777; font-style: italic;" : "color: #111; font-weight: bold;"
+                def staleText = c.isStale ? "<span style='color:#b71c1c; font-size:10px; font-weight: 900; margin-left:4px;'> [STALE]</span>" : ""
+                
+                html << """
+                <div style='display: flex; flex-direction: column; background: white; border: 1px solid #d1d5db; border-radius: 4px; padding: 4px 8px; min-width: 180px; box-shadow: 0 1px 1px rgba(0,0,0,0.05);'>
+                    <div style='${labelStyle} font-size: 12px; margin-bottom: 2px; border-bottom: 1px solid #f0f0f0; padding-bottom: 2px;'>${c.name}${staleText}</div>
+                    <div style='display: flex; justify-content: space-between; align-items: center;'>
+                        <span style='font-size: 12px; color: ${c.isStale ? "#999" : c.color}; font-weight: 600;'>${c.rssi} <small style='font-weight: normal; color: #999;'>dBm</small></span>
+                    </div>
+                    <div style='font-size: 10px; color: #888; margin-top: 2px;'>${c.timeStr}</div>
+                </div>"""
+            }
+            html << "</div>"
+        }
+        html << "</td></tr>"
+    }
+    html << "</table>"
+    return html.join("")
+}
+
+def getSignalIcon(rssi, isExtender, threshold, isOk = false) {
+    // Determine the color
+    def color = getSignalColor(rssi, threshold, isOk)
+    // log.debug "result of getsignalcolor2(${rssi},${threshold},${isOk}) is ${color}"
+    
+
+
+    def baseStyle = "display: inline-block; width: 18px; height: 18px; background-color: ${color}; vertical-align: middle; margin-right: 3px;"
+    
+    if (isExtender) {
+        // A square with a tiny 2px rounding to make it look professional
+        def squareStyle = "border-radius: 2px;" 
+        return "<span style='${baseStyle} ${squareStyle}'></span>"
+    } else {
+        return "<span style='${baseStyle} border-radius: 50%;'></span>"
+    }
+    
+}
+
+/**
+ * Determines the signal color based on RSSI, threshold, and path quality.
+ */
+def getSignalColor(rssi, threshold, isOk = false) {
+    def r = rssi.toInteger()
+    def t = threshold.toInteger()
+
+    // 1. Excellent, green
+    if (r >= t) {
+        return "#2E7D32" 
+    }
+
+    // 2. Good: blue (Within 10dB of threshold)
+    if (r >= (t - 10)) {
+        return "#9CCC65" 
+
+    }
+    
+    // 3. Fair: Amber (Weak signal, but the Hub says it's 'OK' or 'Valid')
+    if (isOk) {
+        return "#FFC107" 
+    } 
+    
+    // 4. Poor: Red (Weak signal AND the Hub reports issues)
+    else {
+        return "#C62828" 
+    }
+}
+
+// Helpers
+
+def rssiNormalize(rssi) {
+    if (rssi == null || rssi == "") return -124
+    int r = rssi.toInteger()
+    if (r >= 125) return -r
+    else if (r == 0) return -124
+    else return r
+}
+
+import groovy.transform.Field
+
+// --- BITMAP LAYOUT CONFIGURATION (13-bit Minutes) ---
+// Total 32-bit Integer: [FF][NNNNNNNN][QQ][RRRRRRR][MMMMMMMMMMMMM]
+// Bits 30-31: Future Use
+// Bits 22-29: Node ID (8 bits)
+// Bits 20-21: Quality (2 bits)
+// Bits 13-19: RSSI    (7 bits)
+// Bits 0-12:  Minutes (13 bits: Max 8,191)
+
+@Field static final int BIT_SHIFT_NODE    = 22
+@Field static final int BIT_SHIFT_QUALITY = 20
+@Field static final int BIT_SHIFT_RSSI    = 13
+@Field static final int BIT_SHIFT_MINS    = 0
+
+@Field static final int MASK_NODE         = 0xFF
+@Field static final int MASK_QUALITY      = 0x03
+@Field static final int MASK_RSSI         = 0x7F
+@Field static final int MASK_MINS         = 0x1FFF
+
+/**
+ * BITMAP ENCODING
+ */
+int encodeRSSIHistory(nodeId, qualityStatus, rssi, minutes) {
+    int n = (nodeId.toInteger()) & MASK_NODE
+    
+    int q = 0
+    if (qualityStatus instanceof Integer) {
+        q = qualityStatus & MASK_QUALITY
+    } else {
+        String status = qualityStatus?.toString()?.toLowerCase()
+        q = ((status == "ok" || status == "valid") ? 1 : (status == "poor" ? 2 : 0)) & MASK_QUALITY
+    }
+    
+    int r = Math.abs(rssi.toInteger()) & MASK_RSSI
+    int m = Math.min(MASK_MINS, minutes.toInteger()) & MASK_MINS
+
+    return (n << BIT_SHIFT_NODE) | 
+           (q << BIT_SHIFT_QUALITY) | 
+           (r << BIT_SHIFT_RSSI) | 
+           (m << BIT_SHIFT_MINS)
+}
+
+/**
+ * BITMAP DECODING
+ */
+Map decodeRSSIHistory(int packed) {
+
+    // BITMAP DECODE
+    return [
+        nodeId:  (packed >> BIT_SHIFT_NODE)    & MASK_NODE,
+        quality: (packed >> BIT_SHIFT_QUALITY) & MASK_QUALITY,
+        rssi:   -((packed >> BIT_SHIFT_RSSI)   & MASK_RSSI),
+        minutes: (packed >> BIT_SHIFT_MINS)    & MASK_MINS,
+        format: "bitmap"
+    ]
+}
+
+
+def deviceHistoryInspectorPage() {
+    dynamicPage(name: "deviceHistoryInspectorPage", title: "RSSI Bitmask Decoder", install: false) {
+        section("Target Device") {
+            // 1. Build and sort the options into a LinkedHashMap to preserve order
+            def sortedOptions = state.deviceInfo?.collectEntries { zid, info -> 
+                [(zid): (info.name ?: zid)] 
+            }?.sort { a, b -> a.value.toLowerCase() <=> b.value.toLowerCase() }
+
+            // 2. Use named parameters for the input to ensure 'searchable' is activated
+            input name: "inspectZid", 
+                  type: "enum", 
+                  title: "Select device to inspect", 
+                  options: sortedOptions, 
+                  required: false, 
+                  submitOnChange: true, 
+                  searchable: true
+        }
+        
+        if (inspectZid) {
+            section {
+                paragraph "Device: <b>${state.deviceInfo[inspectZid]?.name}</b><br>ZID: <small>${inspectZid}</small>"
+                input "btnLogHistory", "button", title: "Log Decoded History to Console"
+            }
+        }
+    }
+}
+
+void logManualHistory(String zid) {
+    // Access the state objects
+    def history = state.rssiHistory ? state.rssiHistory[zid] : null
+    def info = state.deviceInfo ? state.deviceInfo[zid] : null
+
+    if (!history) {
+        log.warn "No rssiHistory found for ZID: ${zid}"
+        return
+    }
+    
+    if (!info) {
+        log.warn "No deviceInfo found for ZID: ${zid}"
+        return
+    }
+
+    long firstMs = info.firstRecord ? info.firstRecord.toLong() : 0
+    String deviceName = info.name ?: "Unknown"
+
+    log.info "--- START DECODE: ${deviceName} ---"
+    
+    // Check if we have a valid anchor for time calculation
+    if (firstMs > 0) {
+        log.info "Anchor Date: ${new Date(firstMs).format('EEE, MMM d, yyyy HH:mm:ss', location.timeZone)}"
+    } else {
+        log.warn "No firstRecord anchor found. Timestamps will be relative offsets only."
+    }
+
+    history.eachWithIndex { packed, i ->
+        // This calls your existing decodeRSSIHistory method
+        Map data = decodeRSSIHistory(packed as int)
+        
+        // Reconstruct the timestamp
+        String timeStr = "N/A"
+        if (firstMs > 0) {
+            long entryTimeMs = firstMs + (data.minutes.toLong() * 60000)
+            timeStr = new Date(entryTimeMs).format("MM/dd HH:mm:ss", location.timeZone)
+        }
+
+        // Determine Path
+        String path = (data.nodeId == 1) ? "HUB" : "NODE ${data.nodeId}"
+        
+        // Log the unpacked data
+        log.info "[${i}] ${timeStr} | Path: ${path.padRight(8)} | RSSI: ${data.rssi} dBm | Quality: ${data.quality}"
+    }
+    
+    log.info "--- END DECODE ---"
+}
+

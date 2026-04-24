@@ -14,6 +14,7 @@
  *  for the specific language governing permissions and limitations under the License.
  */
 
+
 // @todo Other urls that could maybe be used for something
 //    APP_API_BASE_URL + '/mode/location/${location_id}/settings'
 //    APP_API_BASE_URL + '/mode/location/${location_id}/sharing'
@@ -27,6 +28,7 @@ import javax.net.ssl.SSLPeerUnverifiedException
 import groovyx.net.http.ResponseParseException
 import org.apache.http.conn.ConnectTimeoutException
 import org.apache.http.conn.HttpHostConnectException
+
 
 definition(
   name: "Unofficial Ring Connect",
@@ -183,6 +185,13 @@ def mainPage() {
       }
     }
 
+// New code
+
+section("Z-Wave Diagnostics") {
+        paragraph "This button creates the child app that reports z-wave signal strength. Click the button to create the child app & hit 'Done'.\nNow click on the newly created child reporting app to configure it."
+ 	    input name: "btnCreateReporter", type: "button", title: "Install Reporting Child App", backgroundColor: "#27ae60", textColor: "white"
+    }
+      
     section("Configure Logging", hidden: true, hideable: true) {
       input name: "descriptionTextEnable", type: "bool", title: "Enable descriptionText logging", defaultValue: false
       input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
@@ -451,6 +460,7 @@ void initialize() {
   configureDingPolling()
   configureSnapshotPolling()
   schedulePeriodicMaintenance()
+    
 }
 
 mappings {
@@ -1797,3 +1807,78 @@ String getRingDeviceId(String id) {
   "stickup_cam_v4": [name: "Ring Spotlight Cam Battery/Solar", driver: "Ring Virtual Light"],
   "stickup_cam": [name: "Ring Stick Up Cam (1st gen)", driver: "Ring Virtual Camera"],
 ].asImmutable()
+
+/*
+ *  This code was added to support the Unofficial Ring Z-wave Reporting child app.
+*/
+
+def createReportingChild() {
+    def child = getChildApps().find { it.getNamespace() == "ring-hubitat-codahq" && it.getTypeName() == "Unofficial Ring Z-wave Reporting" }
+
+    // 2. Only create if it's missing
+    if (!child) {
+        log.info "Creating Reporting Child App..."
+        try {
+            addChildApp("ring-hubitat-codahq", "Unofficial Ring Z-wave Reporting", "Unofficial Ring Z-wave Reporting Instance")
+        } catch (e) {
+            log.error "Failed to create child app: ${e}"
+        }
+    } else {
+        log.debug "Reporting Child App already exists. Skipping creation."
+    }
+}
+
+// Methods used by the child app to retreive ring device information. 
+
+
+def getAllRingDevices() {
+    def allDevs = []
+    getChildDevices().each { child ->
+        allDevs << child
+        try { if (child.getChildDevices()) allDevs.addAll(child.getChildDevices()) } catch(e) {}
+    }
+    return allDevs
+}
+
+/**
+ * Retrieves a snapshot of essential device information (aspects)
+ * for a specific device. Used by child apps to avoid direct 
+ * access permission issues.
+ */
+
+def getDeviceInfo2(dev) {
+    if (!dev) return null
+
+    // 1. Get Device Info logic
+    def zid = dev.getDataValue("zid")
+    def nodeId = dev.getDataValue("nodeId")
+    def typeName = dev.getTypeName() ?: ""
+        
+    def info = [
+        name: dev.displayName?.trim(),
+        label: (dev.label ?: dev.displayName)?.trim(),
+        id: dev.id,
+        dni: dev.deviceNetworkId,
+        typeName: typeName,
+        zid: zid?.trim(),
+        nodeId: nodeId,
+        zidLower: zid?.toLowerCase()?.trim(),
+        lastActivity: dev.lastActivity
+    ]
+
+    // 2. Get Ring Signal logic
+    def signal = null
+    // Only attempt signal fetch if it's a valid Z-Wave device (not API) and has a ZID
+    if (zid && !typeName.contains("API")) {
+        try {
+            signal = dev.getRingSignal()
+        } catch (e) {
+            signal = null
+        }
+    }
+
+    return [
+        info: info,
+        signal: signal
+    ]
+}
